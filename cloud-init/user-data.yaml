@@ -1,0 +1,337 @@
+#cloud-config
+# =====================================================================
+#  BookStack – celoten stack s cloud-init (Ubuntu 24.04 LTS)
+#  Komponente: Nginx (HTTPS) | PHP-FPM + BookStack | MariaDB | Redis
+#              Prometheus + exporterji | UFW | fail2ban | backupi
+#
+#  Test lokalno:
+#    multipass launch 24.04 --name bookstack --cpus 2 --memory 4G \
+#      --disk 20G --cloud-init user-data.yaml
+#  Validacija:
+#    cloud-init schema --config-file user-data.yaml --annotate
+# =====================================================================
+
+hostname: bookstack
+timezone: Europe/Ljubljana
+
+# --- Uporabniki in SSH ------------------------------------------------
+users:
+  - default                      # ohrani privzetega 'ubuntu' (multipass ključ)
+ssh_pwauth: false
+disable_root: true
+
+# --- Paketi (vse prek apt) --------------------------------------------
+package_update: true
+package_upgrade: true           # varneje, a počasneje – izmeri razliko!
+packages:
+  # spletni strežnik + TLS
+  - nginx
+  - certbot
+  # aplikacija (PHP 8.3 je privzet v 24.04)
+  - php8.3-fpm
+  - php8.3-cli
+  - php8.3-mysql
+  - php8.3-curl
+  - php8.3-mbstring
+  - php8.3-xml
+  - php8.3-zip
+  - php8.3-gd
+  - php8.3-ldap
+  - php8.3-opcache
+  - composer
+  - git
+  - unzip
+  # podatkovna baza + cache
+  - mariadb-server
+  - redis-server
+  # monitoring
+  - prometheus
+  - prometheus-node-exporter
+  - prometheus-nginx-exporter
+  - prometheus-redis-exporter
+  # varnost
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - openssl
+  - curl
+
+# --- Datoteke -----------------------------------------------------------
+# write_files se privzeto izvede v 'init' fazi, PRED namestitvijo paketov.
+# 'defer: true' jih premakne v 'final' fazo (write_files_deferred), ki teče
+# PO package_update_upgrade_install in PRED runcmd (scripts_user).
+write_files:
+  # Nastavitve deploya – to urejaš pred zagonom
+  - path: /etc/bookstack/deploy.env
+    permissions: "0600"
+    content: |
+      # Domena, pod katero bo dosegljiv BookStack
+      DOMAIN=bookstack.local
+      # Admin račun (geslo se generira avtomatsko)
+      ADMIN_EMAIL=admin@example.com
+      # selfsigned = lokalno (multipass); letsencrypt = javna domena (npr. lrk.si VM)
+      CERT_MODE=selfsigned
+      LE_EMAIL=you@student.uni-lj.si
+
+  # SSH utrjevanje
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      MaxAuthTries 3
+      X11Forwarding no
+
+  # Nginx – BookStack vhost
+  - path: /etc/nginx/sites-available/bookstack
+    defer: true
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+          location /.well-known/acme-challenge/ { root /var/www/certbot; }
+          location / { return 301 https://$host$request_uri; }
+      }
+
+      server {
+          listen 443 ssl http2 default_server;
+          listen [::]:443 ssl http2 default_server;
+          server_name _;
+
+          ssl_certificate     /etc/ssl/bookstack/fullchain.pem;
+          ssl_certificate_key /etc/ssl/bookstack/privkey.pem;
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers off;
+          ssl_session_cache shared:SSL:10m;
+
+          server_tokens off;
+          add_header Strict-Transport-Security "max-age=31536000" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+          root /var/www/bookstack/public;
+          index index.php;
+          client_max_body_size 50M;
+
+          access_log /var/log/nginx/bookstack.access.log;
+          error_log  /var/log/nginx/bookstack.error.log;
+
+          location / { try_files $uri $uri/ /index.php?$query_string; }
+
+          location ~ \.php$ {
+              include snippets/fastcgi-php.conf;
+              fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+          }
+
+          location ~ /\.(?!well-known) { deny all; }
+      }
+
+  # Nginx stub_status samo na localhost (za nginx exporter)
+  - path: /etc/nginx/conf.d/status.conf
+    defer: true
+    content: |
+      server {
+          listen 127.0.0.1:8080;
+          access_log off;
+          location = /stub_status { stub_status; }
+      }
+
+  # Prometheus – samo localhost, dostop prek SSH tunela
+  - path: /etc/default/prometheus
+    defer: true
+    content: |
+      ARGS="--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=15d"
+
+  - path: /etc/prometheus/prometheus.yml
+    defer: true
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: prometheus
+          static_configs: [{ targets: ["127.0.0.1:9090"] }]
+        - job_name: node
+          static_configs: [{ targets: ["127.0.0.1:9100"] }]
+        - job_name: nginx
+          static_configs: [{ targets: ["127.0.0.1:9113"] }]
+        - job_name: redis
+          static_configs: [{ targets: ["127.0.0.1:9121"] }]
+
+  - path: /etc/default/prometheus-nginx-exporter
+    defer: true
+    content: |
+      ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"
+
+  # fail2ban
+  - path: /etc/fail2ban/jail.local
+    defer: true
+    content: |
+      [DEFAULT]
+      bantime  = 1h
+      findtime = 10m
+      maxretry = 5
+
+      [sshd]
+      enabled = true
+      backend = systemd
+
+      [nginx-botsearch]
+      enabled = true
+      logpath = /var/log/nginx/bookstack.access.log
+
+  # Dnevni backup baze in uploadov (hrani 7 dni)
+  - path: /etc/cron.d/bookstack-backup
+    defer: true
+    content: |
+      15 3 * * * root mysqldump --single-transaction bookstack | gzip > /var/backups/bookstack/db-$(date +\%F).sql.gz && tar czf /var/backups/bookstack/uploads-$(date +\%F).tar.gz -C /var/www/bookstack public/uploads storage/uploads && find /var/backups/bookstack -type f -mtime +7 -delete
+
+  # Rotacija Laravel logov
+  - path: /etc/logrotate.d/bookstack
+    defer: true
+    content: |
+      /var/www/bookstack/storage/logs/*.log {
+          weekly
+          rotate 8
+          compress
+          missingok
+          notifempty
+          su www-data www-data
+          create 0640 www-data www-data
+      }
+
+  # Glavna namestitvena skripta (idempotentna, logira v /var/log/bookstack-setup.log)
+  - path: /opt/bookstack/install.sh
+    defer: true
+    permissions: "0750"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      exec > >(tee -a /var/log/bookstack-setup.log) 2>&1
+      echo "=== BookStack setup start: $(date) ==="
+
+      # cloud-init runcmd nima nujno nastavljenega HOME -> composer ga rabi
+      export HOME=/root COMPOSER_HOME=/root/.composer COMPOSER_ALLOW_SUPERUSER=1
+
+      source /etc/bookstack/deploy.env
+      APP_DIR=/var/www/bookstack
+      SECRETS=/root/bookstack-secrets.env
+
+      # --- 1) Skrivnosti: generirane na VM, nikoli v gitu ---------------
+      if [ ! -f "$SECRETS" ]; then
+        umask 077
+        {
+          echo "DB_PASS=$(openssl rand -hex 24)"
+          echo "REDIS_PASS=$(openssl rand -hex 24)"
+          echo "ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=')"
+        } > "$SECRETS"
+        umask 022
+      fi
+      source "$SECRETS"
+
+      # --- 2) MariaDB ---------------------------------------------------
+      mysql -u root <<SQL
+      DELETE FROM mysql.user WHERE User='';
+      DROP DATABASE IF EXISTS test;
+      CREATE DATABASE IF NOT EXISTS bookstack CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+      CREATE USER IF NOT EXISTS 'bookstack'@'localhost' IDENTIFIED BY '${DB_PASS}';
+      GRANT ALL PRIVILEGES ON bookstack.* TO 'bookstack'@'localhost';
+      FLUSH PRIVILEGES;
+      SQL
+
+      # --- 3) Redis (geslo, posluša samo na localhost) -------------------
+      grep -q '^requirepass ' /etc/redis/redis.conf \
+        || echo "requirepass ${REDIS_PASS}" >> /etc/redis/redis.conf
+      systemctl restart redis-server
+      echo "ARGS=\"--redis.addr=redis://127.0.0.1:6379 --redis.password=${REDIS_PASS}\"" \
+        > /etc/default/prometheus-redis-exporter
+      chmod 600 /etc/default/prometheus-redis-exporter
+
+      # --- 4) BookStack -------------------------------------------------
+      if [ ! -d "$APP_DIR" ]; then
+        git clone --depth 1 --branch release --single-branch \
+          https://github.com/BookStackApp/BookStack.git "$APP_DIR"
+      fi
+      cd "$APP_DIR"
+      composer install --no-dev --no-interaction --optimize-autoloader
+
+      if [ ! -f .env ]; then
+        # Preveri imena spremenljivk v .env.example.complete (CACHE_DRIVER, REDIS_SERVERS)
+        cat > .env <<EOF
+      APP_KEY=
+      APP_URL=https://${DOMAIN}
+      APP_ENV=production
+      APP_DEBUG=false
+      DB_HOST=localhost
+      DB_DATABASE=bookstack
+      DB_USERNAME=bookstack
+      DB_PASSWORD=${DB_PASS}
+      CACHE_DRIVER=redis
+      SESSION_DRIVER=redis
+      REDIS_SERVERS=127.0.0.1:6379:0:${REDIS_PASS}
+      SESSION_SECURE_COOKIE=true
+      MAIL_DRIVER=log
+      EOF
+        php artisan key:generate --force
+      fi
+      php artisan migrate --force
+
+      # Privzeti admin (admin@admin.com / password) -> naš email + naključno geslo
+      HASH=$(php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$ADMIN_PASS")
+      mysql -u root bookstack -e \
+        "UPDATE users SET email='${ADMIN_EMAIL}', password='${HASH}' WHERE email='admin@admin.com';"
+
+      php artisan config:cache
+      chown -R root:www-data "$APP_DIR"
+      chown -R www-data:www-data storage bootstrap/cache public/uploads
+      chmod 640 .env
+
+      # --- 5) TLS certifikat ------------------------------------------
+      mkdir -p /etc/ssl/bookstack /var/www/certbot
+      if [ ! -e /etc/ssl/bookstack/fullchain.pem ]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          -keyout /etc/ssl/bookstack/privkey.pem -out /etc/ssl/bookstack/fullchain.pem \
+          -subj "/CN=${DOMAIN}" -addext "subjectAltName=DNS:${DOMAIN}"
+        chmod 600 /etc/ssl/bookstack/privkey.pem
+      fi
+
+      # --- 6) Nginx -----------------------------------------------------
+      rm -f /etc/nginx/sites-enabled/default
+      ln -sf /etc/nginx/sites-available/bookstack /etc/nginx/sites-enabled/bookstack
+      nginx -t && systemctl reload nginx
+
+      if [ "$CERT_MODE" = "letsencrypt" ]; then
+        certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
+          --non-interactive --agree-tos -m "$LE_EMAIL" \
+          --deploy-hook "systemctl reload nginx"
+        ln -sf "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" /etc/ssl/bookstack/fullchain.pem
+        ln -sf "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"   /etc/ssl/bookstack/privkey.pem
+        systemctl reload nginx
+      fi
+
+      # --- 7) Varnost, monitoring, backupi ------------------------------
+      systemctl restart ssh
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow OpenSSH
+      ufw allow 'Nginx Full'
+      ufw --force enable
+      systemctl enable --now fail2ban unattended-upgrades
+      systemctl restart fail2ban
+      mkdir -p /var/backups/bookstack && chmod 700 /var/backups/bookstack
+      systemctl restart prometheus prometheus-node-exporter \
+        prometheus-nginx-exporter prometheus-redis-exporter
+      systemctl restart php8.3-fpm
+
+      # --- 8) Health check ----------------------------------------------
+      curl -kfsS -o /dev/null https://127.0.0.1/login \
+        && echo "HEALTHCHECK OK" || echo "HEALTHCHECK FAILED"
+      echo "Admin: ${ADMIN_EMAIL} | geslo v ${SECRETS}"
+      echo "=== BookStack setup done: $(date) ==="
+
+# --- runcmd teče v final fazi, PO paketih in deferred write_files ------
+runcmd:
+  - [bash, /opt/bookstack/install.sh]
+
+final_message: "BookStack ready after $UPTIME s. Log: /var/log/bookstack-setup.log"
