@@ -30,6 +30,7 @@ apt:
   conf: |
     Acquire::ForceIPv4 "true";
     Acquire::Retries "3";
+    APT::Install-Recommends "false";
 
 # --- Paketi (vse prek apt) --------------------------------------------
 package_update: true
@@ -234,6 +235,7 @@ write_files:
       SECRETS=/root/bookstack-secrets.env
 
       # --- 1) Skrivnosti: generirane na VM, nikoli v gitu ---------------
+      step "Skrivnosti"
       if [ ! -f "$SECRETS" ]; then
         umask 077
         {
@@ -246,6 +248,7 @@ write_files:
       source "$SECRETS"
 
       # --- 2) MariaDB ---------------------------------------------------
+      step "MariaDB"
       mysql -u root <<SQL
       DELETE FROM mysql.user WHERE User='';
       DROP DATABASE IF EXISTS test;
@@ -256,6 +259,7 @@ write_files:
       SQL
 
       # --- 3) Redis (geslo, posluša samo na localhost) -------------------
+      step "Redis"
       grep -q '^requirepass ' /etc/redis/redis.conf \
         || echo "requirepass ${REDIS_PASS}" >> /etc/redis/redis.conf
       systemctl restart redis-server
@@ -264,13 +268,17 @@ write_files:
       chmod 600 /etc/default/prometheus-redis-exporter
 
       # --- 4) BookStack -------------------------------------------------
+      step "BookStack clone"
       if [ ! -d "$APP_DIR" ]; then
         git clone --depth 1 --branch release --single-branch \
           https://github.com/BookStackApp/BookStack.git "$APP_DIR"
       fi
       cd "$APP_DIR"
+
+      step "Composer"
       composer install --no-dev --no-interaction --optimize-autoloader --prefer-dist --no-progress
 
+      step "Migracije"
       if [ ! -f .env ]; then
         # Preveri imena spremenljivk v .env.example.complete (CACHE_DRIVER, REDIS_SERVERS)
         cat > .env <<EOF
@@ -303,6 +311,7 @@ write_files:
       chmod 640 .env
 
       # --- 5) TLS certifikat ------------------------------------------
+      step "TLS + Nginx"
       mkdir -p /etc/ssl/bookstack /var/www/certbot
       if [ ! -e /etc/ssl/bookstack/fullchain.pem ]; then
         openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
@@ -326,6 +335,7 @@ write_files:
       fi
 
       # --- 7) Varnost, monitoring, backupi ------------------------------
+      step "Varnost + monitoring"
       systemctl restart ssh
       ufw default deny incoming
       ufw default allow outgoing
@@ -340,12 +350,15 @@ write_files:
       systemctl restart php8.3-fpm
 
       # --- 8) Health check ----------------------------------------------
+      step "Healthcheck"
       curl -kfsS -o /dev/null https://127.0.0.1/login \
         && echo "HEALTHCHECK OK" || echo "HEALTHCHECK FAILED"
       echo "Admin: ${ADMIN_EMAIL} | geslo v ${SECRETS}"
 
+      # --- 9) Varnostne posodobitve v ozadju (ne zadržujejo deploya) ---
       systemd-run --unit=post-deploy-upgrade unattended-upgrade
 
+      step "Konec"
       echo "=== BookStack setup done: $(date) ==="
 
 # --- runcmd teče v final fazi, PO paketih in deferred write_files ------
