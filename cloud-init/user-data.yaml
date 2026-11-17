@@ -67,11 +67,13 @@ write_files:
     content: |
       # Domena, pod katero bo dosegljiv BookStack
       DOMAIN=bookstack.local
+      # URL, prek katerega odpiraš BookStack v brskalniku
+      APP_URL=https://localhost:9443
       # Admin račun (geslo se generira avtomatsko)
       ADMIN_EMAIL=admin@example.com
       # selfsigned = lokalno (multipass); letsencrypt = javna domena (npr. lrk.si VM)
       CERT_MODE=selfsigned
-      LE_EMAIL=you@student.uni-lj.si
+      LE_EMAIL=miha.grmsek@gmail.com
 
   # SSH utrjevanje
   - path: /etc/ssh/sshd_config.d/99-hardening.conf
@@ -114,6 +116,7 @@ write_files:
           root /var/www/bookstack/public;
           index index.php;
           client_max_body_size 50M;
+          error_page 497 =301 https://$host:$server_port$request_uri;
 
           access_log /var/log/nginx/bookstack.access.log;
           error_log  /var/log/nginx/bookstack.error.log;
@@ -260,7 +263,7 @@ write_files:
         # Preveri imena spremenljivk v .env.example.complete (CACHE_DRIVER, REDIS_SERVERS)
         cat > .env <<EOF
       APP_KEY=
-      APP_URL=https://${DOMAIN}
+      APP_URL=${APP_URL:-https://${DOMAIN}}
       APP_ENV=production
       APP_DEBUG=false
       DB_HOST=localhost
