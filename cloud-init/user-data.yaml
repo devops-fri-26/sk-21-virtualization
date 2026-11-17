@@ -20,9 +20,20 @@ users:
 ssh_pwauth: false
 disable_root: true
 
+bootcmd:
+  - rm -f /var/lib/man-db/auto-update
+
+apt:
+  primary:
+    - arches: [default]
+      uri: http://si.archive.ubuntu.com/ubuntu
+  conf: |
+    Acquire::ForceIPv4 "true";
+    Acquire::Retries "3";
+
 # --- Paketi (vse prek apt) --------------------------------------------
 package_update: true
-package_upgrade: true           # varneje, a počasneje – izmeri razliko!
+package_upgrade: false
 packages:
   # spletni strežnik + TLS
   - nginx
@@ -212,10 +223,11 @@ write_files:
       #!/usr/bin/env bash
       set -euo pipefail
       exec > >(tee -a /var/log/bookstack-setup.log) 2>&1
+      step() { echo "[$(date +%T)] >>> $*"; }
       echo "=== BookStack setup start: $(date) ==="
 
       # cloud-init runcmd nima nujno nastavljenega HOME -> composer ga rabi
-      export HOME=/root COMPOSER_HOME=/root/.composer COMPOSER_ALLOW_SUPERUSER=1
+      export HOME=/root COMPOSER_HOME=/root/.composer COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_IPRESOLVE=4
 
       source /etc/bookstack/deploy.env
       APP_DIR=/var/www/bookstack
@@ -257,7 +269,7 @@ write_files:
           https://github.com/BookStackApp/BookStack.git "$APP_DIR"
       fi
       cd "$APP_DIR"
-      composer install --no-dev --no-interaction --optimize-autoloader
+      composer install --no-dev --no-interaction --optimize-autoloader --prefer-dist --no-progress
 
       if [ ! -f .env ]; then
         # Preveri imena spremenljivk v .env.example.complete (CACHE_DRIVER, REDIS_SERVERS)
@@ -331,6 +343,9 @@ write_files:
       curl -kfsS -o /dev/null https://127.0.0.1/login \
         && echo "HEALTHCHECK OK" || echo "HEALTHCHECK FAILED"
       echo "Admin: ${ADMIN_EMAIL} | geslo v ${SECRETS}"
+
+      systemd-run --unit=post-deploy-upgrade unattended-upgrade
+
       echo "=== BookStack setup done: $(date) ==="
 
 # --- runcmd teče v final fazi, PO paketih in deferred write_files ------
