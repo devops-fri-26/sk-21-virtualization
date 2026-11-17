@@ -550,6 +550,9 @@ write_files:
 
       # cloud-init runcmd nima nujno nastavljenega HOME -> composer ga rabi
       export HOME=/root COMPOSER_HOME=/root/.composer COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_IPRESOLVE=4
+      # VirtualBox NAT se zatika pri veliko sočasnih povezavah: privzetih 12
+      # vzporednih prenosov = ~11 min, 2 vzporedna = ~45 s (izmerjeno)
+      export COMPOSER_MAX_PARALLEL_HTTP=2
       export DEBIAN_FRONTEND=noninteractive
 
       source /etc/bookstack/deploy.env
@@ -572,8 +575,8 @@ write_files:
       source "$SECRETS"
 
       # --- Observability: Grafana + Loki + Alloy – teče V OZADJU ------
-      # Uradni Grafana apt repozitorij. Ni odvisno od BookStacka: paketi se
-      # prenašajo sočasno s composerjem, namestijo pa med migracijami.
+      # Uradni Grafana apt repozitorij. Ni odvisno od BookStacka, zato teče
+      # sočasno z migracijami, TLS in nastavitvijo varnosti.
       # Izpis gre v /var/log/bookstack-observability.log.
       wait_http() {   # wait_http <url> <ime>  – čaka do 120 s
         for _ in $(seq 1 60); do
@@ -597,14 +600,6 @@ write_files:
         apt-get -o DPkg::Lock::Timeout=300 update \
           -o Dir::Etc::sourcelist=sources.list.d/grafana.list \
           -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
-        # Faza 1: samo prenos paketov (omrežje) – teče sočasno s composerjem
-        apt-get -o DPkg::Lock::Timeout=300 install -y --download-only grafana loki alloy
-        # Faza 2: namestitev šele, ko composer konča – dpkg in composer
-        # sicer tekmujeta za disk in oba postaneta zelo počasna
-        for _ in $(seq 1 900); do
-          [ -e /run/bookstack-composer.done ] && break
-          sleep 1
-        done
         apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold \
           install -y grafana loki alloy
 
@@ -651,10 +646,6 @@ write_files:
         wait_http http://127.0.0.1:12345/-/ready Alloy
       }
 
-      step "Grafana + Loki + Alloy (start v ozadju)"
-      install_observability > /var/log/bookstack-observability.log 2>&1 &
-      OBS_PID=$!
-
       # --- 2) MariaDB ---------------------------------------------------
       step "MariaDB"
       mysql -u root <<SQL
@@ -685,7 +676,12 @@ write_files:
 
       step "Composer"
       composer install --no-dev --no-interaction --optimize-autoloader --prefer-dist --no-progress
-      touch /run/bookstack-composer.done   # signal za namestitev v ozadju
+
+      # Grafana/Loki/Alloy v ozadju šele PO composerju: sočasen prenos ~600 MB
+      # paketov in composer skozi VirtualBox NAT upočasni composer na ~5 min
+      step "Grafana + Loki + Alloy (start v ozadju)"
+      install_observability > /var/log/bookstack-observability.log 2>&1 &
+      OBS_PID=$!
 
       step "Migracije"
       if [ ! -f .env ]; then
