@@ -2,11 +2,10 @@
 # =====================================================================
 #  BookStack – celoten stack s cloud-init (Ubuntu 24.04 LTS)
 #  Komponente: Nginx (HTTPS) | PHP-FPM + BookStack | MariaDB | Redis
-#              Prometheus + exporterji | UFW | fail2ban | backupi
+#              Prometheus + exporterji | Grafana | UFW | fail2ban | backupi
 #
-#  Test lokalno:
-#    multipass launch 24.04 --name bookstack --cpus 2 --memory 4G \
-#      --disk 20G --cloud-init user-data.yaml
+#  Zagon (VirtualBox + NoCloud):  ./launch.sh up
+#  Javni način (Let's Encrypt):   PUBLIC_DOMAIN=... LE_EMAIL=... ./launch.sh up
 #  Validacija:
 #    cloud-init schema --config-file user-data.yaml --annotate
 # =====================================================================
@@ -16,13 +15,15 @@ timezone: Europe/Ljubljana
 
 # --- Uporabniki in SSH ------------------------------------------------
 users:
-  - default                      # ohrani privzetega 'ubuntu' (multipass ključ)
+  - default                      # privzeti 'ubuntu'; ključ doda launch.sh
 ssh_pwauth: false
 disable_root: true
 
+# --- Zgodnji ukazi (pred namestitvijo paketov) -----------------------
 bootcmd:
-  - rm -f /var/lib/man-db/auto-update
+  - rm -f /var/lib/man-db/auto-update   # apt ne gradi man indeksa = hitrejša namestitev
 
+# --- Apt ----------------------------------------------------------------
 apt:
   primary:
     - arches: [default]
@@ -34,7 +35,7 @@ apt:
 
 # --- Paketi (vse prek apt) --------------------------------------------
 package_update: true
-package_upgrade: false
+package_upgrade: false           # varnostne posodobitve tečejo v ozadju po deployu
 packages:
   # spletni strežnik + TLS
   - nginx
@@ -56,7 +57,7 @@ packages:
   # podatkovna baza + cache
   - mariadb-server
   - redis-server
-  # monitoring
+  # monitoring (Grafana se namesti iz uradnega repozitorija v install.sh)
   - prometheus
   - prometheus-node-exporter
   - prometheus-nginx-exporter
@@ -67,13 +68,14 @@ packages:
   - unattended-upgrades
   - openssl
   - curl
+  - gnupg
 
 # --- Datoteke -----------------------------------------------------------
 # write_files se privzeto izvede v 'init' fazi, PRED namestitvijo paketov.
 # 'defer: true' jih premakne v 'final' fazo (write_files_deferred), ki teče
 # PO package_update_upgrade_install in PRED runcmd (scripts_user).
 write_files:
-  # Nastavitve deploya – to urejaš pred zagonom
+  # Nastavitve deploya – to urejaš pred zagonom (launch.sh jih v javnem načinu zamenja)
   - path: /etc/bookstack/deploy.env
     permissions: "0600"
     content: |
@@ -83,9 +85,9 @@ write_files:
       APP_URL=https://localhost:9443
       # Admin račun (geslo se generira avtomatsko)
       ADMIN_EMAIL=admin@example.com
-      # selfsigned = lokalno (multipass); letsencrypt = javna domena (npr. lrk.si VM)
+      # selfsigned = lokalno; letsencrypt = javna domena
       CERT_MODE=selfsigned
-      LE_EMAIL=miha.grmsek@gmail.com
+      LE_EMAIL=you@student.uni-lj.si
 
   # SSH utrjevanje
   - path: /etc/ssh/sshd_config.d/99-hardening.conf
@@ -96,7 +98,16 @@ write_files:
       MaxAuthTries 3
       X11Forwarding no
 
-  # Nginx – BookStack vhost
+  # WebSocket podpora (Grafana Live)
+  - path: /etc/nginx/conf.d/websocket-map.conf
+    defer: true
+    content: |
+      map $http_upgrade $connection_upgrade {
+          default upgrade;
+          ''      close;
+      }
+
+  # Nginx – BookStack vhost + Grafana na /grafana/
   - path: /etc/nginx/sites-available/bookstack
     defer: true
     content: |
@@ -120,18 +131,34 @@ write_files:
           ssl_session_cache shared:SSL:10m;
 
           server_tokens off;
+          absolute_redirect off;
           add_header Strict-Transport-Security "max-age=31536000" always;
           add_header X-Content-Type-Options "nosniff" always;
           add_header X-Frame-Options "SAMEORIGIN" always;
           add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
+          # HTTP zahteva na HTTPS port -> preusmeri na HTTPS
+          error_page 497 =301 https://$http_host$request_uri;
+
           root /var/www/bookstack/public;
           index index.php;
           client_max_body_size 50M;
-          error_page 497 =301 https://$host:$server_port$request_uri;
 
           access_log /var/log/nginx/bookstack.access.log;
           error_log  /var/log/nginx/bookstack.error.log;
+
+          # Grafana (posluša samo na 127.0.0.1:3000)
+          location = /grafana { return 301 /grafana/; }
+          location ^~ /grafana/ {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection $connection_upgrade;
+          }
 
           location / { try_files $uri $uri/ /index.php?$query_string; }
 
@@ -153,7 +180,7 @@ write_files:
           location = /stub_status { stub_status; }
       }
 
-  # Prometheus – samo localhost, dostop prek SSH tunela
+  # Prometheus – samo localhost, Grafana ga bere lokalno
   - path: /etc/default/prometheus
     defer: true
     content: |
@@ -178,6 +205,136 @@ write_files:
     defer: true
     content: |
       ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"
+
+  # Grafana – samodejno dodan Prometheus vir
+  - path: /etc/grafana/provisioning/datasources/prometheus.yaml
+    defer: true
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: prometheus
+          access: proxy
+          url: http://127.0.0.1:9090
+          isDefault: true
+          editable: false
+
+  # Grafana – nalaganje dashboardov iz /etc/grafana/dashboards
+  - path: /etc/grafana/provisioning/dashboards/bookstack.yaml
+    defer: true
+    content: |
+      apiVersion: 1
+      providers:
+        - name: bookstack
+          folder: BookStack
+          type: file
+          disableDeletion: true
+          options:
+            path: /etc/grafana/dashboards
+
+  # Grafana – dashboard za celoten stack
+  - path: /etc/grafana/dashboards/bookstack-stack.json
+    defer: true
+    content: |
+      {
+        "uid": "bookstack-stack",
+        "title": "BookStack stack",
+        "tags": ["bookstack"],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "refresh": "30s",
+        "time": { "from": "now-1h", "to": "now" },
+        "panels": [
+          {
+            "id": 1, "type": "stat", "title": "Stanje storitev (Prometheus targets)",
+            "gridPos": { "x": 0, "y": 0, "w": 24, "h": 4 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "expr": "up", "legendFormat": "{{job}}",
+              "instant": true, "range": false }],
+            "fieldConfig": { "defaults": {
+              "mappings": [{ "type": "value", "options": {
+                "0": { "text": "DOWN", "color": "red" },
+                "1": { "text": "UP", "color": "green" } } }],
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+            "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } }
+          },
+          {
+            "id": 2, "type": "timeseries", "title": "CPU",
+            "gridPos": { "x": 0, "y": 4, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "legendFormat": "CPU",
+              "expr": "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100" }],
+            "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } }
+          },
+          {
+            "id": 3, "type": "timeseries", "title": "Pomnilnik",
+            "gridPos": { "x": 8, "y": 4, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "legendFormat": "RAM",
+              "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100" }],
+            "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } }
+          },
+          {
+            "id": 4, "type": "gauge", "title": "Disk /",
+            "gridPos": { "x": 16, "y": 4, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A",
+              "expr": "(1 - node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"}) * 100" }],
+            "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100,
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null }, { "color": "orange", "value": 70 },
+                { "color": "red", "value": 90 } ] } } }
+          },
+          {
+            "id": 5, "type": "timeseries", "title": "Omrežje",
+            "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [
+              { "refId": "A", "legendFormat": "prejeto {{device}}",
+                "expr": "rate(node_network_receive_bytes_total{device!=\"lo\"}[5m])" },
+              { "refId": "B", "legendFormat": "poslano {{device}}",
+                "expr": "rate(node_network_transmit_bytes_total{device!=\"lo\"}[5m])" }],
+            "fieldConfig": { "defaults": { "unit": "Bps" } }
+          },
+          {
+            "id": 6, "type": "timeseries", "title": "Nginx",
+            "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [
+              { "refId": "A", "legendFormat": "zahtev/s",
+                "expr": "rate(nginx_http_requests_total[5m])" },
+              { "refId": "B", "legendFormat": "aktivne povezave",
+                "expr": "nginx_connections_active" }],
+            "fieldConfig": { "defaults": { "unit": "short" } }
+          },
+          {
+            "id": 7, "type": "timeseries", "title": "Redis pomnilnik",
+            "gridPos": { "x": 0, "y": 20, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "legendFormat": "used",
+              "expr": "redis_memory_used_bytes" }],
+            "fieldConfig": { "defaults": { "unit": "bytes" } }
+          },
+          {
+            "id": 8, "type": "timeseries", "title": "Redis odjemalci",
+            "gridPos": { "x": 8, "y": 20, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "legendFormat": "clients",
+              "expr": "redis_connected_clients" }],
+            "fieldConfig": { "defaults": { "unit": "short" } }
+          },
+          {
+            "id": 9, "type": "timeseries", "title": "Redis ukazi/s",
+            "gridPos": { "x": 16, "y": 20, "w": 8, "h": 8 },
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "targets": [{ "refId": "A", "legendFormat": "ops/s",
+              "expr": "rate(redis_commands_processed_total[5m])" }],
+            "fieldConfig": { "defaults": { "unit": "ops" } }
+          }
+        ]
+      }
 
   # fail2ban
   - path: /etc/fail2ban/jail.local
@@ -229,10 +386,12 @@ write_files:
 
       # cloud-init runcmd nima nujno nastavljenega HOME -> composer ga rabi
       export HOME=/root COMPOSER_HOME=/root/.composer COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_IPRESOLVE=4
+      export DEBIAN_FRONTEND=noninteractive
 
       source /etc/bookstack/deploy.env
       APP_DIR=/var/www/bookstack
       SECRETS=/root/bookstack-secrets.env
+      PUBLIC_URL="${APP_URL:-https://${DOMAIN}}"
 
       # --- 1) Skrivnosti: generirane na VM, nikoli v gitu ---------------
       step "Skrivnosti"
@@ -242,10 +401,63 @@ write_files:
           echo "DB_PASS=$(openssl rand -hex 24)"
           echo "REDIS_PASS=$(openssl rand -hex 24)"
           echo "ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=')"
+          echo "GRAFANA_PASS=$(openssl rand -base64 18 | tr -d '/+=')"
         } > "$SECRETS"
         umask 022
       fi
       source "$SECRETS"
+
+      # --- Grafana (uradni apt repozitorij) – teče V OZADJU -------------
+      # Ni odvisna od BookStacka, zato se namešča sočasno s composerjem in
+      # migracijami. Izpis gre v /var/log/bookstack-grafana.log.
+      install_grafana() {
+        set -euo pipefail
+        if [ ! -f /etc/apt/sources.list.d/grafana.list ]; then
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.grafana.com/gpg.key \
+            | gpg --batch --yes --dearmor -o /etc/apt/keyrings/grafana.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" \
+            > /etc/apt/sources.list.d/grafana.list
+        fi
+        # osveži samo Grafana repozitorij (hitreje kot celoten apt update)
+        apt-get -o DPkg::Lock::Timeout=300 update \
+          -o Dir::Etc::sourcelist=sources.list.d/grafana.list \
+          -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+        apt-get -o DPkg::Lock::Timeout=300 install -y grafana
+
+        # Admin geslo v ločeni datoteki (ni vidno v 'systemctl show')
+        install -m 0600 /dev/null /etc/grafana/admin.env
+        echo "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASS}" > /etc/grafana/admin.env
+
+        install -d /etc/systemd/system/grafana-server.service.d
+        cat > /etc/systemd/system/grafana-server.service.d/override.conf <<EOF
+      [Service]
+      Environment=GF_SERVER_HTTP_ADDR=127.0.0.1
+      Environment=GF_SERVER_ROOT_URL=${PUBLIC_URL}/grafana/
+      Environment=GF_SERVER_SERVE_FROM_SUB_PATH=true
+      Environment=GF_USERS_ALLOW_SIGN_UP=false
+      Environment=GF_AUTH_ANONYMOUS_ENABLED=false
+      Environment=GF_SECURITY_COOKIE_SECURE=true
+      Environment=GF_ANALYTICS_REPORTING_ENABLED=false
+      Environment=GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      EnvironmentFile=/etc/grafana/admin.env
+      EOF
+        systemctl daemon-reload
+        systemctl enable grafana-server
+        systemctl restart grafana-server
+
+        # počakaj, da Grafana zažene (prvi zagon ustvari bazo)
+        for _ in $(seq 1 60); do
+          curl -fsS -o /dev/null http://127.0.0.1:3000/grafana/api/health && return 0
+          sleep 2
+        done
+        echo "Grafana se ni zagnala v 120 s"
+        return 1
+      }
+
+      step "Grafana (start v ozadju)"
+      install_grafana > /var/log/bookstack-grafana.log 2>&1 &
+      GRAFANA_PID=$!
 
       # --- 2) MariaDB ---------------------------------------------------
       step "MariaDB"
@@ -283,7 +495,7 @@ write_files:
         # Preveri imena spremenljivk v .env.example.complete (CACHE_DRIVER, REDIS_SERVERS)
         cat > .env <<EOF
       APP_KEY=
-      APP_URL=${APP_URL:-https://${DOMAIN}}
+      APP_URL=${PUBLIC_URL}
       APP_ENV=production
       APP_DEBUG=false
       DB_HOST=localhost
@@ -351,13 +563,25 @@ write_files:
         prometheus-nginx-exporter prometheus-redis-exporter
       systemctl restart php8.3-fpm
 
-      # --- 8) Health check ----------------------------------------------
-      step "Healthcheck"
-      curl -kfsS -o /dev/null https://127.0.0.1/login \
-        && echo "HEALTHCHECK OK" || echo "HEALTHCHECK FAILED"
-      echo "Admin: ${ADMIN_EMAIL} | geslo v ${SECRETS}"
+      # --- 8) Grafana: počakaj na namestitev v ozadju -------------------
+      step "Grafana (čakam na konec)"
+      if ! wait "$GRAFANA_PID"; then
+        echo "Namestitev Grafane ni uspela:"
+        tail -n 30 /var/log/bookstack-grafana.log
+        exit 1
+      fi
 
-      # --- 9) Varnostne posodobitve v ozadju (ne zadržujejo deploya) ---
+      # --- 9) Health check ----------------------------------------------
+      step "Healthcheck"
+      HC=OK
+      curl -kfsS -o /dev/null https://127.0.0.1/login || HC=FAILED
+      curl -kfsS -o /dev/null https://127.0.0.1/grafana/api/health || HC=FAILED
+      echo "HEALTHCHECK ${HC}"
+      echo "BookStack: ${PUBLIC_URL} (${ADMIN_EMAIL})"
+      echo "Grafana:   ${PUBLIC_URL}/grafana/ (admin)"
+      echo "Gesla v ${SECRETS}"
+
+      # --- 10) Varnostne posodobitve v ozadju (ne zadržujejo deploya) --
       systemd-run --unit=post-deploy-upgrade unattended-upgrade
 
       step "Konec"
