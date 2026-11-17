@@ -2,7 +2,8 @@
 # =====================================================================
 #  BookStack – celoten stack s cloud-init (Ubuntu 24.04 LTS)
 #  Komponente: Nginx (HTTPS) | PHP-FPM + BookStack | MariaDB | Redis
-#              Prometheus + exporterji | Grafana | UFW | fail2ban | backupi
+#              Prometheus + exporterji | Grafana | Loki + Alloy (logi)
+#              UFW | fail2ban | backupi
 #
 #  Zagon (VirtualBox + NoCloud):  ./launch.sh up
 #  Javni način (Let's Encrypt):   PUBLIC_DOMAIN=... LE_EMAIL=... ./launch.sh up
@@ -57,7 +58,7 @@ packages:
   # podatkovna baza + cache
   - mariadb-server
   - redis-server
-  # monitoring (Grafana se namesti iz uradnega repozitorija v install.sh)
+  # monitoring (Grafana, Loki, Alloy se namestijo iz uradnega repozitorija v install.sh)
   - prometheus
   - prometheus-node-exporter
   - prometheus-nginx-exporter
@@ -87,7 +88,7 @@ write_files:
       ADMIN_EMAIL=admin@example.com
       # selfsigned = lokalno; letsencrypt = javna domena
       CERT_MODE=selfsigned
-      LE_EMAIL=you@student.uni-lj.si
+      LE_EMAIL=miha.grmsek@gmail.com
 
   # SSH utrjevanje
   - path: /etc/ssh/sshd_config.d/99-hardening.conf
@@ -200,13 +201,17 @@ write_files:
           static_configs: [{ targets: ["127.0.0.1:9113"] }]
         - job_name: redis
           static_configs: [{ targets: ["127.0.0.1:9121"] }]
+        - job_name: loki
+          static_configs: [{ targets: ["127.0.0.1:3100"] }]
+        - job_name: alloy
+          static_configs: [{ targets: ["127.0.0.1:12345"] }]
 
   - path: /etc/default/prometheus-nginx-exporter
     defer: true
     content: |
       ARGS="--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"
 
-  # Grafana – samodejno dodan Prometheus vir
+  # Grafana – samodejno dodana vira: Prometheus (metrike) in Loki (logi)
   - path: /etc/grafana/provisioning/datasources/prometheus.yaml
     defer: true
     content: |
@@ -219,6 +224,165 @@ write_files:
           url: http://127.0.0.1:9090
           isDefault: true
           editable: false
+        - name: Loki
+          type: loki
+          uid: loki
+          access: proxy
+          url: http://127.0.0.1:3100
+          editable: false
+
+  # Loki – shranjevanje logov (en proces, lokalni disk, hrani 7 dni)
+  - path: /etc/bookstack/observability/loki.yaml
+    defer: true
+    content: |
+      auth_enabled: false
+      server:
+        http_listen_address: 127.0.0.1
+        http_listen_port: 3100
+        grpc_listen_address: 127.0.0.1
+        grpc_listen_port: 9096
+        log_level: warn
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /var/lib/loki
+        replication_factor: 1
+        storage:
+          filesystem:
+            chunks_directory: /var/lib/loki/chunks
+            rules_directory: /var/lib/loki/rules
+        ring:
+          kvstore:
+            store: inmemory
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      limits_config:
+        retention_period: 168h
+      compactor:
+        working_directory: /var/lib/loki/compactor
+        retention_enabled: true
+        delete_request_store: filesystem
+      analytics:
+        reporting_enabled: false
+
+  # Alloy – zbira loge iz datotek in systemd journala ter jih pošilja v Loki
+  - path: /etc/bookstack/observability/config.alloy
+    defer: true
+    content: |
+      // Nginx dostopi in napake
+      local.file_match "nginx" {
+        path_targets = [
+          {"__path__" = "/var/log/nginx/bookstack.access.log", "job" = "nginx", "type" = "access"},
+          {"__path__" = "/var/log/nginx/bookstack.error.log",  "job" = "nginx", "type" = "error"},
+        ]
+      }
+
+      // BookStack (Laravel), fail2ban in log deploya
+      local.file_match "app" {
+        path_targets = [
+          {"__path__" = "/var/www/bookstack/storage/logs/*.log", "job" = "bookstack"},
+          {"__path__" = "/var/log/fail2ban.log",                 "job" = "fail2ban"},
+          {"__path__" = "/var/log/bookstack-setup.log",          "job" = "deploy"},
+        ]
+      }
+
+      loki.source.file "files" {
+        targets    = array.concat(local.file_match.nginx.targets, local.file_match.app.targets)
+        forward_to = [loki.write.local.receiver]
+      }
+
+      // systemd journal (SSH prijave, storitve) – oznaka 'unit' iz imena enote
+      loki.relabel "journal" {
+        forward_to = []
+        rule {
+          source_labels = ["__journal__systemd_unit"]
+          target_label  = "unit"
+        }
+      }
+
+      loki.source.journal "system" {
+        max_age       = "12h"
+        labels        = {job = "systemd-journal"}
+        relabel_rules = loki.relabel.journal.rules
+        forward_to    = [loki.write.local.receiver]
+      }
+
+      loki.write "local" {
+        endpoint {
+          url = "http://127.0.0.1:3100/loki/api/v1/push"
+        }
+      }
+
+  # Grafana – dashboard za loge
+  - path: /etc/grafana/dashboards/bookstack-logs.json
+    defer: true
+    content: |
+      {
+        "uid": "bookstack-logs",
+        "title": "BookStack logi",
+        "tags": ["bookstack", "logs"],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "refresh": "30s",
+        "time": { "from": "now-6h", "to": "now" },
+        "panels": [
+          {
+            "id": 1, "type": "timeseries", "title": "HTTP zahteve po statusu",
+            "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [{ "refId": "A", "legendFormat": "{{status}}",
+              "expr": "sum by (status) (count_over_time({job=\"nginx\", type=\"access\"} | pattern `<_> - <_> [<_>] \"<_> <_> <_>\" <status> <_>` [5m]))" }],
+            "fieldConfig": { "defaults": { "unit": "short" } }
+          },
+          {
+            "id": 2, "type": "timeseries", "title": "Napake (Nginx + BookStack)",
+            "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [
+              { "refId": "A", "legendFormat": "nginx error",
+                "expr": "sum(count_over_time({job=\"nginx\", type=\"error\"} [5m]))" },
+              { "refId": "B", "legendFormat": "bookstack error",
+                "expr": "sum(count_over_time({job=\"bookstack\"} |~ \"(?i)error\" [5m]))" }],
+            "fieldConfig": { "defaults": { "unit": "short" } }
+          },
+          {
+            "id": 3, "type": "logs", "title": "SSH prijave",
+            "gridPos": { "x": 0, "y": 8, "w": 12, "h": 10 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [{ "refId": "A",
+              "expr": "{job=\"systemd-journal\", unit=~\"ssh.*\"} |~ \"Accepted|Failed|Invalid user\"" }],
+            "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+          },
+          {
+            "id": 4, "type": "logs", "title": "fail2ban",
+            "gridPos": { "x": 12, "y": 8, "w": 12, "h": 10 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [{ "refId": "A", "expr": "{job=\"fail2ban\"} |~ \"Ban|Unban\"" }],
+            "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+          },
+          {
+            "id": 5, "type": "logs", "title": "Nginx dostopi",
+            "gridPos": { "x": 0, "y": 18, "w": 24, "h": 10 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [{ "refId": "A", "expr": "{job=\"nginx\", type=\"access\"}" }],
+            "options": { "showTime": true, "sortOrder": "Descending" }
+          },
+          {
+            "id": 6, "type": "logs", "title": "BookStack (Laravel) in Nginx napake",
+            "gridPos": { "x": 0, "y": 28, "w": 24, "h": 10 },
+            "datasource": { "type": "loki", "uid": "loki" },
+            "targets": [{ "refId": "A",
+              "expr": "{job=~\"bookstack|nginx\", type!=\"access\"}" }],
+            "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true }
+          }
+        ]
+      }
 
   # Grafana – nalaganje dashboardov iz /etc/grafana/dashboards
   - path: /etc/grafana/provisioning/dashboards/bookstack.yaml
@@ -407,10 +571,20 @@ write_files:
       fi
       source "$SECRETS"
 
-      # --- Grafana (uradni apt repozitorij) – teče V OZADJU -------------
-      # Ni odvisna od BookStacka, zato se namešča sočasno s composerjem in
-      # migracijami. Izpis gre v /var/log/bookstack-grafana.log.
-      install_grafana() {
+      # --- Observability: Grafana + Loki + Alloy – teče V OZADJU ------
+      # Uradni Grafana apt repozitorij. Ni odvisno od BookStacka: paketi se
+      # prenašajo sočasno s composerjem, namestijo pa med migracijami.
+      # Izpis gre v /var/log/bookstack-observability.log.
+      wait_http() {   # wait_http <url> <ime>  – čaka do 120 s
+        for _ in $(seq 1 60); do
+          curl -fsS -o /dev/null "$1" && return 0
+          sleep 2
+        done
+        echo "$2 se ni zagnal v 120 s"
+        return 1
+      }
+
+      install_observability() {
         set -euo pipefail
         if [ ! -f /etc/apt/sources.list.d/grafana.list ]; then
           install -d -m 0755 /etc/apt/keyrings
@@ -423,9 +597,34 @@ write_files:
         apt-get -o DPkg::Lock::Timeout=300 update \
           -o Dir::Etc::sourcelist=sources.list.d/grafana.list \
           -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
-        apt-get -o DPkg::Lock::Timeout=300 install -y grafana
+        # Faza 1: samo prenos paketov (omrežje) – teče sočasno s composerjem
+        apt-get -o DPkg::Lock::Timeout=300 install -y --download-only grafana loki alloy
+        # Faza 2: namestitev šele, ko composer konča – dpkg in composer
+        # sicer tekmujeta za disk in oba postaneta zelo počasna
+        for _ in $(seq 1 900); do
+          [ -e /run/bookstack-composer.done ] && break
+          sleep 1
+        done
+        apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold \
+          install -y grafana loki alloy
 
-        # Admin geslo v ločeni datoteki (ni vidno v 'systemctl show')
+        # --- Loki: naša konfiguracija prek systemd drop-in ---------------
+        id -u loki >/dev/null 2>&1 \
+          || useradd --system --no-create-home --shell /usr/sbin/nologin loki
+        # paket ustvari uporabnika 'loki' brez lastne skupine -> samo lastnik
+        install -d -o loki -m 0750 /var/lib/loki
+        install -d /etc/systemd/system/loki.service.d
+        cat > /etc/systemd/system/loki.service.d/override.conf <<EOF
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/loki -config.file=/etc/bookstack/observability/loki.yaml
+      EOF
+
+        # --- Alloy: konfiguracija + bralne pravice za loge ----------------
+        install -m 0644 /etc/bookstack/observability/config.alloy /etc/alloy/config.alloy
+        usermod -aG adm,systemd-journal alloy   # adm: /var/log/nginx, fail2ban.log
+
+        # --- Grafana: admin geslo v ločeni datoteki -----------------------
         install -m 0600 /dev/null /etc/grafana/admin.env
         echo "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASS}" > /etc/grafana/admin.env
 
@@ -442,22 +641,19 @@ write_files:
       Environment=GF_ANALYTICS_CHECK_FOR_UPDATES=false
       EnvironmentFile=/etc/grafana/admin.env
       EOF
-        systemctl daemon-reload
-        systemctl enable grafana-server
-        systemctl restart grafana-server
 
-        # počakaj, da Grafana zažene (prvi zagon ustvari bazo)
-        for _ in $(seq 1 60); do
-          curl -fsS -o /dev/null http://127.0.0.1:3000/grafana/api/health && return 0
-          sleep 2
-        done
-        echo "Grafana se ni zagnala v 120 s"
-        return 1
+        systemctl daemon-reload
+        systemctl enable loki alloy grafana-server
+        systemctl restart loki alloy grafana-server
+
+        wait_http http://127.0.0.1:3000/grafana/api/health Grafana
+        wait_http http://127.0.0.1:3100/ready Loki
+        wait_http http://127.0.0.1:12345/-/ready Alloy
       }
 
-      step "Grafana (start v ozadju)"
-      install_grafana > /var/log/bookstack-grafana.log 2>&1 &
-      GRAFANA_PID=$!
+      step "Grafana + Loki + Alloy (start v ozadju)"
+      install_observability > /var/log/bookstack-observability.log 2>&1 &
+      OBS_PID=$!
 
       # --- 2) MariaDB ---------------------------------------------------
       step "MariaDB"
@@ -489,6 +685,7 @@ write_files:
 
       step "Composer"
       composer install --no-dev --no-interaction --optimize-autoloader --prefer-dist --no-progress
+      touch /run/bookstack-composer.done   # signal za namestitev v ozadju
 
       step "Migracije"
       if [ ! -f .env ]; then
@@ -563,19 +760,23 @@ write_files:
         prometheus-nginx-exporter prometheus-redis-exporter
       systemctl restart php8.3-fpm
 
-      # --- 8) Grafana: počakaj na namestitev v ozadju -------------------
-      step "Grafana (čakam na konec)"
-      if ! wait "$GRAFANA_PID"; then
-        echo "Namestitev Grafane ni uspela:"
-        tail -n 30 /var/log/bookstack-grafana.log
+      # --- 8) Observability: počakaj na namestitev v ozadju -------------
+      step "Grafana + Loki + Alloy (čakam na konec)"
+      if ! wait "$OBS_PID"; then
+        echo "Namestitev Grafana/Loki/Alloy ni uspela:"
+        tail -n 30 /var/log/bookstack-observability.log
         exit 1
       fi
+      # Alloy je dobil skupine adm/systemd-journal ob zagonu; Nginx in
+      # fail2ban sta zdaj gotovo zagnana, zato ga za vsak slučaj ponovno zaženi
+      systemctl restart alloy
 
       # --- 9) Health check ----------------------------------------------
       step "Healthcheck"
       HC=OK
       curl -kfsS -o /dev/null https://127.0.0.1/login || HC=FAILED
       curl -kfsS -o /dev/null https://127.0.0.1/grafana/api/health || HC=FAILED
+      curl -fsS -o /dev/null http://127.0.0.1:3100/ready || HC=FAILED
       echo "HEALTHCHECK ${HC}"
       echo "BookStack: ${PUBLIC_URL} (${ADMIN_EMAIL})"
       echo "Grafana:   ${PUBLIC_URL}/grafana/ (admin)"

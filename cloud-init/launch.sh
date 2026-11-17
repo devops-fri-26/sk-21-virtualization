@@ -81,6 +81,7 @@ build_seed() {
   log "Gradim NoCloud seed ISO"
   rm -rf "$DATA_DIR"
   mkdir -p "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
   # user-data = naš user-data.yaml + SSH ključ privzetega uporabnika (samo za ta zagon)
   {
     cat "$SCRIPT_DIR/user-data.yaml"
@@ -100,6 +101,7 @@ s|^      LE_EMAIL=.*|      LE_EMAIL=${LE_EMAIL}\n      LE_STAGING=${LE_STAGING}|
       || die "Zamenjava v deploy.env ni uspela – preveri blok deploy.env v user-data.yaml"
     log "Javni način: https://${PUBLIC_DOMAIN} (LE_STAGING=${LE_STAGING})"
   fi
+
   # nov instance-id ob vsakem zagonu -> cloud-init se vedno izvede na novo
   printf 'instance-id: %s-%s\nlocal-hostname: bookstack\n' "$VM_NAME" "$(date +%s)" \
     > "$DATA_DIR/meta-data"
