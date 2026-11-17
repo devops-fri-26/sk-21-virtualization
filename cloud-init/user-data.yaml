@@ -326,7 +326,9 @@ write_files:
       nginx -t && systemctl reload nginx
 
       if [ "$CERT_MODE" = "letsencrypt" ]; then
-        certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
+        STAGING_FLAG=""
+        [ "${LE_STAGING:-0}" = "1" ] && STAGING_FLAG="--test-cert"
+        certbot certonly $STAGING_FLAG --webroot -w /var/www/certbot -d "$DOMAIN" \
           --non-interactive --agree-tos -m "$LE_EMAIL" \
           --deploy-hook "systemctl reload nginx"
         ln -sf "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" /etc/ssl/bookstack/fullchain.pem

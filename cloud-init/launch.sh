@@ -11,6 +11,10 @@
 #
 #  Nastavitve lahko povoziš z okoljskimi spremenljivkami, npr.:
 #    CPUS=4 MEMORY=8192 ./launch.sh up
+#
+#  Javni način z Let's Encrypt (najprej testni certifikat, nato pravi):
+#    PUBLIC_DOMAIN=devops-sk-21.lrk.si LE_EMAIL=ti@student.uni-lj.si ./launch.sh up
+#    PUBLIC_DOMAIN=... LE_EMAIL=... LE_STAGING=0 ./launch.sh up
 # =====================================================================
 set -euo pipefail
 
@@ -24,6 +28,12 @@ SSH_PORT="${SSH_PORT:-2422}"      # porti na hostu (samo 127.0.0.1)
 HTTP_PORT="${HTTP_PORT:-9080}"
 HTTPS_PORT="${HTTPS_PORT:-9443}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+
+# Javni način: PUBLIC_DOMAIN nastavljen -> Let's Encrypt + HTTP/HTTPS porti na vseh IP-jih
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+LE_EMAIL="${LE_EMAIL:-}"
+LE_STAGING="${LE_STAGING:-1}"     # 1 = testni LE certifikat (brez rate limitov), 0 = pravi
+if [ -n "$PUBLIC_DOMAIN" ]; then BIND_IP=""; else BIND_IP="127.0.0.1"; fi
 
 IMG_RELEASE="noble"               # Ubuntu 24.04 LTS
 IMG_FILE="${IMG_RELEASE}-server-cloudimg-amd64.vmdk"
@@ -76,6 +86,20 @@ build_seed() {
     cat "$SCRIPT_DIR/user-data.yaml"
     printf '\n# --- dodano z launch.sh ---\nssh_authorized_keys:\n  - %s\n' "$(cat "$SSH_KEY.pub")"
   } > "$DATA_DIR/user-data"
+
+  # Javni način: v bloku deploy.env zamenjaj domeno, URL in način certifikata
+  if [ -n "$PUBLIC_DOMAIN" ]; then
+    [ -n "$LE_EMAIL" ] || die "Za PUBLIC_DOMAIN nastavi še LE_EMAIL"
+    sed -i "/path: \/etc\/bookstack\/deploy.env/,/^  - path:/{
+s|^      DOMAIN=.*|      DOMAIN=${PUBLIC_DOMAIN}|
+s|^      APP_URL=.*|      APP_URL=https://${PUBLIC_DOMAIN}|
+s|^      CERT_MODE=.*|      CERT_MODE=letsencrypt|
+s|^      LE_EMAIL=.*|      LE_EMAIL=${LE_EMAIL}\n      LE_STAGING=${LE_STAGING}|
+}" "$DATA_DIR/user-data"
+    grep -q "^      CERT_MODE=letsencrypt" "$DATA_DIR/user-data" \
+      || die "Zamenjava v deploy.env ni uspela – preveri blok deploy.env v user-data.yaml"
+    log "Javni način: https://${PUBLIC_DOMAIN} (LE_STAGING=${LE_STAGING})"
+  fi
   # nov instance-id ob vsakem zagonu -> cloud-init se vedno izvede na novo
   printf 'instance-id: %s-%s\nlocal-hostname: bookstack\n' "$VM_NAME" "$(date +%s)" \
     > "$DATA_DIR/meta-data"
@@ -90,8 +114,8 @@ create_vm() {
     --boot1 disk --nic1 nat \
     --uart1 0x3F8 4 --uartmode1 file "$DATA_DIR/console.log"
   VBoxManage modifyvm "$VM_NAME" --natpf1 "ssh,tcp,127.0.0.1,$SSH_PORT,,22"
-  VBoxManage modifyvm "$VM_NAME" --natpf1 "http,tcp,127.0.0.1,$HTTP_PORT,,80"
-  VBoxManage modifyvm "$VM_NAME" --natpf1 "https,tcp,127.0.0.1,$HTTPS_PORT,,443"
+  VBoxManage modifyvm "$VM_NAME" --natpf1 "http,tcp,$BIND_IP,$HTTP_PORT,,80"
+  VBoxManage modifyvm "$VM_NAME" --natpf1 "https,tcp,$BIND_IP,$HTTPS_PORT,,443"
 
   # cloud image -> VDI (VirtualBox) in povečanje diska; growpart ga v VM razširi sam
   VBoxManage clonemedium disk "$CACHE_DIR/$IMG_FILE" "$DATA_DIR/disk.vdi" --format VDI >/dev/null
@@ -131,7 +155,11 @@ cmd_up() {
   wait_ready
   log "Deploy končan v ${SECONDS} s"
   echo "  SSH:    ./launch.sh ssh"
-  echo "  HTTPS:  https://localhost:$HTTPS_PORT (na laptopu prek port forwarda)"
+  if [ -n "$PUBLIC_DOMAIN" ]; then
+    echo "  HTTPS:  https://$PUBLIC_DOMAIN"
+  else
+    echo "  HTTPS:  https://localhost:$HTTPS_PORT (na laptopu prek port forwarda)"
+  fi
   echo "  Geslo:  ./launch.sh ssh sudo cat /root/bookstack-secrets.env"
 }
 
