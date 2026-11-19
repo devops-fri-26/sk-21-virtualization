@@ -124,7 +124,9 @@ create_vm() {
   VBoxManage closemedium disk "$CACHE_DIR/$IMG_FILE" >/dev/null 2>&1 || true
   VBoxManage modifymedium disk "$DATA_DIR/disk.vdi" --resize "$DISK_MB"
 
-  VBoxManage storagectl "$VM_NAME" --name SATA --add sata --controller IntelAhci --portcount 2
+  # hostiocache: VM piše prek predpomnilnika gostitelja -> hitrejši disk
+  VBoxManage storagectl "$VM_NAME" --name SATA --add sata --controller IntelAhci \
+    --portcount 2 --hostiocache on
   VBoxManage storageattach "$VM_NAME" --storagectl SATA --port 0 --device 0 \
     --type hdd --medium "$DATA_DIR/disk.vdi"
   VBoxManage storageattach "$VM_NAME" --storagectl SATA --port 1 --device 0 \

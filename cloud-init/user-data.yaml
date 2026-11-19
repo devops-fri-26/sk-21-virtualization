@@ -33,6 +33,9 @@ apt:
     Acquire::ForceIPv4 "true";
     Acquire::Retries "3";
     APT::Install-Recommends "false";
+    // dpkg brez fsync po vsaki datoteki: veliko hitrejša namestitev na
+    // virtualnem disku (tveganje le ob izpadu med namestitvijo = nov deploy)
+    DPkg::Options:: "--force-unsafe-io";
 
 # --- Paketi (vse prek apt) --------------------------------------------
 package_update: true
