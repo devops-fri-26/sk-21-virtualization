@@ -97,11 +97,11 @@ Preverila sva tudi ponovno izvajanje skripte z `vagrant provision` in delovanje 
 
 ### BookStack
 
-![BookStack](vagrant/screenshots/bookstack.png)
+![BookStack](screenshots/bookstack.png)
 
 ### Netdata
 
-![Netdata](vagrant/screenshots/netdata.png)
+![Netdata](sreenshots/netdata.png)
 
 ## Datoteke
 
