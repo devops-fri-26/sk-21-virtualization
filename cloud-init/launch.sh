@@ -13,7 +13,7 @@
 #    CPUS=4 MEMORY=8192 ./launch.sh up
 #
 #  Javni način z Let's Encrypt (najprej testni certifikat, nato pravi):
-#    PUBLIC_DOMAIN=devops-sk-21.lrk.si LE_EMAIL=ti@student.uni-lj.si ./launch.sh up
+#    PUBLIC_DOMAIN=devops-sk-21.lrk.si LE_EMAIL=miha.grmsek@google.com ./launch.sh up
 #    PUBLIC_DOMAIN=... LE_EMAIL=... LE_STAGING=0 ./launch.sh up
 # =====================================================================
 set -euo pipefail
