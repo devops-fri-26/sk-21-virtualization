@@ -86,4 +86,4 @@ Deploy traja slabih **8 minut**.
 
 ![Deploy](../docs/screenshots/deploy.jpg)
 
-![Deploy video](../docs/screenshots/deployVid.mp4)
+https://github.com/devops-fri-26/sk-21-virtualization/blob/cloud-init/docs/screenshots/deployVid.mp4
