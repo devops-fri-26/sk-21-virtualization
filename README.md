@@ -101,7 +101,7 @@ Preverila sva tudi ponovno izvajanje skripte z `vagrant provision` in delovanje 
 
 ### Netdata
 
-![Netdata](sreenshots/netdata.png)
+![Netdata](screenshots/netdata.png)
 
 ## Datoteke
 
